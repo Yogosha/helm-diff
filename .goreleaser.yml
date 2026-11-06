@@ -1,0 +1,101 @@
+# To test this manually, run:
+#  go install github.com/goreleaser/goreleaser@latest
+#  goreleaser --snapshot --clean
+#  for f in dist/helm-diff*.tgz; do echo Testing $f...; tar tzvf $f; done
+project_name: helm-diff
+builds:
+  - id: default
+    main: .
+    binary: bin/diff
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -X github.com/databus23/helm-diff/v3/cmd.Version={{ .Version }}
+    goos:
+      - freebsd
+      - darwin
+      - linux
+      - windows
+    goarch:
+      - amd64
+      - arm64
+  - id: linux-additional
+    main: .
+    binary: bin/diff
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -X github.com/databus23/helm-diff/v3/cmd.Version={{ .Version }}
+    goos:
+      - linux
+    goarch:
+      - arm
+      - ppc64le
+      - s390x
+    goarm:
+      - "6"
+      - "7"
+
+# Archives wrap their content in a "diff/" directory. This is the layout
+# every install/update hook released so far expects when it downloads a
+# release tarball (it copies "$HELM_TMP/diff/bin/diff"), so it must not be
+# changed: wrapping in any other directory breaks `helm plugin update` on
+# all pre-existing installs (issue #1076).
+#
+# Helm 4, when installing from a *local* tarball, derives the directory it
+# expects inside the archive from the tarball file name: "<name>-<version>-…"
+# must contain "<name>/" (helm strips a trailing version component from the
+# name; see stripPluginName in helm's plugin installer). To support that
+# flow (issue #1071) each platform is published a second time under a
+# versioned name, "diff-<version>-<os>-<arch>.tgz": the historical
+# "helm-diff-<os>-<arch>.tgz" name cannot satisfy helm 4 because it carries
+# no version component to strip. Both names wrap the identical "diff/"
+# layout, and each gets its own ".prov" provenance signature (helm's
+# verification matches file names against the checksums in the ".prov").
+archives:
+  - id: default
+    builds:
+    - default
+    - linux-additional
+    format: tgz
+    name_template: '{{ .ProjectName }}-{{ if eq .Os "darwin" }}macos{{ else }}{{ .Os }}{{ end }}-{{ .Arch }}{{ if .Arm }}v{{ .Arm }}{{ end }}'
+    wrap_in_directory: diff
+    files:
+    - README.md
+    - plugin.yaml
+    - LICENSE
+    - install-binary.sh
+    - install-binary.ps1
+  # The same archive under a versioned, helm 4-friendly name so it can be
+  # installed (and provenance-verified) directly from a local tarball.
+  - id: versioned
+    builds:
+    - default
+    - linux-additional
+    format: tgz
+    name_template: 'diff-{{ .Version }}-{{ if eq .Os "darwin" }}macos{{ else }}{{ .Os }}{{ end }}-{{ .Arch }}{{ if .Arm }}v{{ .Arm }}{{ end }}'
+    wrap_in_directory: diff
+    files:
+    - README.md
+    - plugin.yaml
+    - LICENSE
+    - install-binary.sh
+    - install-binary.ps1
+
+signs:
+  - id: plugin-provenance
+    artifacts: archive
+    signature: "${artifact}.prov"
+    cmd: ./scripts/sign-provenance.sh
+    args:
+      - ${artifact}
+      - ${signature}
+changelog:
+  use: github-native
+
+release:
+  prerelease: false
