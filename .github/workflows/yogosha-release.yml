@@ -1,0 +1,198 @@
+# Rebuilds the latest databus23/helm-diff release with every Go dependency
+# bumped, and publishes it on this repository as <upstream tag>-yogosha.<n>.
+#
+# Each release tag points to a parentless commit: a snapshot of the upstream
+# tree (without .github, which GITHUB_TOKEN is not allowed to push) plus the
+# dependency bump and the patches below. Nothing is ever merged, so syncing
+# with upstream can never conflict.
+name: Yogosha release
+
+on:
+  schedule:
+    - cron: '0 5 * * 1'  # every Monday, 05:00 UTC
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: 'databus23/helm-diff tag to rebuild (default: latest release)'
+        required: false
+      force:
+        description: 'Release even if nothing changed since the last build'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: yogosha-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: databus23/helm-diff
+  TRIVY_VERSION: 0.76.1
+  TRIVY_SHA256: c7cbe3137fb8a48a17574bede3dd6beb16742d1e9772929940fc90082c39d9c0
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout tooling
+        uses: actions/checkout@v7
+        with:
+          path: tools
+          persist-credentials: false
+
+      - name: Resolve upstream tag
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_REF: ${{ inputs.upstream_ref }}
+        run: |
+          ref="${INPUT_REF:-$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name)}"
+          echo "Upstream tag: $ref"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout upstream
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ steps.upstream.outputs.ref }}
+          path: src
+          persist-credentials: false
+
+      - name: Set up Go (latest stable)
+        uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          check-latest: true
+          cache: false
+
+      - name: Bump dependencies
+        env:
+          GOTOOLCHAIN: local
+        run: tools/yogosha/bump.sh src tools/yogosha/overrides.txt
+
+      - name: Show dependency changes
+        working-directory: src
+        run: git diff go.mod
+
+      - name: Vet and test
+        working-directory: src
+        env:
+          GOTOOLCHAIN: local
+        run: |
+          go vet ./...
+          go test ./...
+
+      - name: Build binary for scanning
+        working-directory: src
+        env:
+          GOTOOLCHAIN: local
+          CGO_ENABLED: '0'
+        run: go build -trimpath -o "$RUNNER_TEMP/diff" .
+
+      - name: Install trivy
+        run: |
+          cd "$RUNNER_TEMP"
+          tgz="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          curl -sSfLO "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/${tgz}"
+          echo "${TRIVY_SHA256}  ${tgz}" | sha256sum -c -
+          tar xzf "$tgz" trivy
+          sudo install trivy /usr/local/bin/trivy
+
+      - name: Scan binary (fail on fixable HIGH/CRITICAL)
+        run: |
+          trivy rootfs --scanners vuln --format table "$RUNNER_TEMP/diff"
+          trivy rootfs -q --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed \
+            --exit-code 1 "$RUNNER_TEMP/diff"
+
+      - name: Compute version
+        id: version
+        working-directory: src
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_REF: ${{ steps.upstream.outputs.ref }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          fingerprint="upstream=$UPSTREAM_REF go=$(go env GOVERSION) gosum=$(sha256sum go.sum | cut -d' ' -f1)"
+          echo "Fingerprint: $fingerprint"
+          echo "$fingerprint" > YOGOSHA_BUILD
+
+          last_n="$(git ls-remote --tags --refs "https://github.com/$GITHUB_REPOSITORY.git" "refs/tags/${UPSTREAM_REF}-yogosha.*" \
+            | sed "s|.*refs/tags/${UPSTREAM_REF}-yogosha\.||" | grep -E '^[0-9]+$' | sort -n | tail -1 || true)"
+          n=1
+          if [ -n "$last_n" ]; then
+            last="${UPSTREAM_REF}-yogosha.${last_n}"
+            n=$(( last_n + 1 ))
+            previous="$(gh api "repos/$GITHUB_REPOSITORY/contents/YOGOSHA_BUILD?ref=$last" --jq .content | base64 -d || true)"
+            if [ "$previous" = "$fingerprint" ] && [ "$FORCE" != "true" ]; then
+              echo "Nothing changed since $last, skipping release."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          echo "tag=${UPSTREAM_REF}-yogosha.${n}" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "Release: ${UPSTREAM_REF}-yogosha.${n}"
+
+      - name: Create release snapshot
+        if: steps.version.outputs.skip == 'false'
+        working-directory: src
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          UPSTREAM_REF: ${{ steps.upstream.outputs.ref }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          owner="${GITHUB_REPOSITORY%%/*}"
+
+          # install hooks must download binaries from this fork's releases
+          sed -i "s|^PROJECT_GH=\"databus23/|PROJECT_GH=\"${owner}/|" install-binary.sh
+          grep -q "^PROJECT_GH=\"${owner}/" install-binary.sh
+          sed -i "s|github.com/databus23/helm-diff/releases|github.com/${GITHUB_REPOSITORY}/releases|g" install-binary.ps1
+          if grep -q "github.com/databus23/helm-diff/releases" install-binary.ps1; then
+            echo "install-binary.ps1 still points to databus23"; exit 1
+          fi
+
+          sed -i "s|^version: .*|version: \"${TAG#v}\"|" plugin.yaml
+          grep -q "^version: \"${TAG#v}\"" plugin.yaml
+
+          # -yogosha.N looks like a semver pre-release: publish it as a normal
+          # release so that releases/latest (used by `helm plugin update`) finds it
+          sed -i 's|^  prerelease: auto|  prerelease: false|' .goreleaser.yml
+          grep -q '^  prerelease: false' .goreleaser.yml
+
+          rm -rf .git .github
+          git init -q
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "helm-diff ${TAG}
+
+          Snapshot of ${UPSTREAM}@${UPSTREAM_REF} with all Go dependencies bumped.
+          Built by ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          git tag "$TAG"
+          git push -q "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/tags/$TAG"
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+
+          {
+            echo "Rebuild of [${UPSTREAM}@${UPSTREAM_REF}](https://github.com/${UPSTREAM}/releases/tag/${UPSTREAM_REF}) with every Go dependency bumped to clear known CVEs."
+            echo
+            echo "Build: \`$(cat YOGOSHA_BUILD)\`"
+            echo
+            echo '```'
+            go version -m "$RUNNER_TEMP/diff" | grep -vE '^\s+build\s' | sed 's/\th1:.*//'
+            echo '```'
+          } > "$RUNNER_TEMP/notes.md"
+
+      - name: Run GoReleaser
+        if: steps.version.outputs.skip == 'false'
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: '~> v1'
+          workdir: src
+          args: release --clean --skip=sign --release-notes ${{ runner.temp }}/notes.md
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GOTOOLCHAIN: local
