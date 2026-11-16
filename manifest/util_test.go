@@ -1,0 +1,200 @@
+package manifest
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
+
+func Test_deleteStatusAndTidyMetadata(t *testing.T) {
+	tests := []struct {
+		name    string
+		obj     []byte
+		want    map[string]any
+		wantErr bool
+	}{
+		{
+			name:    "not valid json",
+			obj:     []byte("notvalid"),
+			want:    nil,
+			wantErr: true,
+		},
+		{
+			name:    "null json",
+			obj:     []byte("null"),
+			want:    nil,
+			wantErr: false,
+		},
+		{
+			name: "valid json",
+			obj: []byte(`
+{
+    "apiVersion": "apps/v1",
+    "kind": "Deployment",
+    "metadata": {
+        "annotations": {
+            "deployment.kubernetes.io/revision": "1",
+            "meta.helm.sh/release-name": "test-release",
+            "meta.helm.sh/release-namespace": "test-ns",
+            "other-annot": "value"
+        },
+        "creationTimestamp": "2025-03-03T10:07:50Z",
+        "generation": 1,
+        "labels": {
+            "app": "nginx",
+            "app.kubernetes.io/managed-by": "Helm"
+        },
+        "name": "nginx-deployment",
+        "namespace": "test-ns",
+        "resourceVersion": "33648",
+        "uid": "7a8d3b74-6452-46f4-a31f-4fdacbe828ac"
+    },
+    "spec": {
+        "template": {
+            "spec": {
+                "containers": [
+                    {
+                        "image": "nginx:1.14.2",
+                        "imagePullPolicy": "IfNotPresent",
+                        "name": "nginx"
+                    }
+                ]
+            }
+        }
+    },
+    "status": {
+        "availableReplicas": 2
+    }
+}
+`),
+			want: map[string]any{
+				"apiVersion": "apps/v1",
+				"kind":       "Deployment",
+				"metadata": map[string]any{
+					"annotations": map[string]any{
+						"other-annot": "value",
+					},
+					"labels": map[string]interface{}{
+						"app": "nginx",
+					},
+					"name":      "nginx-deployment",
+					"namespace": "test-ns",
+				},
+				"spec": map[string]any{
+					"template": map[string]any{
+						"spec": map[string]any{
+							"containers": []any{
+								map[string]any{
+									"image":           "nginx:1.14.2",
+									"imagePullPolicy": "IfNotPresent",
+									"name":            "nginx",
+								},
+							},
+						},
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "empty labels are removed",
+			obj: []byte(`
+{
+    "kind": "ConfigMap",
+    "metadata": {
+        "labels": {
+            "app.kubernetes.io/managed-by": "Helm"
+        },
+        "name": "example"
+    }
+}
+`),
+			want: map[string]interface{}{
+				"kind": "ConfigMap",
+				"metadata": map[string]interface{}{
+					"name": "example",
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "null labels are removed (chart renders bare labels: key)",
+			obj: []byte(`
+{
+    "kind": "ConfigMap",
+    "metadata": {
+        "labels": null,
+        "name": "example"
+    }
+}
+`),
+			want: map[string]interface{}{
+				"kind": "ConfigMap",
+				"metadata": map[string]interface{}{
+					"name": "example",
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "null annotations are removed",
+			obj: []byte(`
+{
+    "kind": "ConfigMap",
+    "metadata": {
+        "annotations": null,
+        "labels": {
+            "app": "kept"
+        },
+        "name": "example"
+    }
+}
+`),
+			want: map[string]interface{}{
+				"kind": "ConfigMap",
+				"metadata": map[string]interface{}{
+					"labels": map[string]interface{}{
+						"app": "kept",
+					},
+					"name": "example",
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "labels with other keys are kept",
+			obj: []byte(`
+{
+    "kind": "ConfigMap",
+    "metadata": {
+        "labels": {
+            "app.kubernetes.io/managed-by": "Helm",
+            "app.kubernetes.io/name": "myapp"
+        },
+        "name": "example"
+    }
+}
+`),
+			want: map[string]interface{}{
+				"kind": "ConfigMap",
+				"metadata": map[string]interface{}{
+					"labels": map[string]interface{}{
+						"app.kubernetes.io/name": "myapp",
+					},
+					"name": "example",
+				},
+			},
+			wantErr: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := deleteStatusAndTidyMetadata(tt.obj)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("deleteStatusAndTidyMetadata() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			require.Equalf(t, tt.want, got, "deleteStatusAndTidyMetadata() = %v, want %v", got, tt.want)
+		})
+	}
+}
